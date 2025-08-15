@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "es6",
+    "module": "esnext",
+    "moduleResolution": "node",
+    "strict": true,
+    "types": ["@figma/plugin-typings"],
+    "allowJs": true,
+    "noEmit": true
+  },
+  "include": [
+    "code.js"
+  ]
+}
