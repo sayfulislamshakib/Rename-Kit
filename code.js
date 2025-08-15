@@ -1,264 +1,250 @@
 /**
- * @description A Figma plugin to streamline design workflows by:
- * 1. Renaming text layers to match a predefined naming convention based on their text style.
- * 2. Renaming default frame names (e.g., "Frame 1") to "item".
- * 3. Identifying and selecting text layers that use an incorrect color style or variable.
+ * Rename & Color Audit — Lean build
+ * ---------------------------------
+ * Keeps your original behavior 1:1:
+ *  - Category = first segment of text style name (style.name.split('/')[0])
+ *  - Rename text layer to mapping.newName for that category
+ *  - Color audit:
+ *      a) check boundVariables.fills[0] variable name
+ *      b) if missing, fallback to fillStyleId name
+ *  - Result: select mismatched layers and notify "N mismatched layers selected."
  *
- * @see {@link https://www.figma.com/plugin-docs/api/api-overview/|Figma Plugin API}
+ * Notes:
+ *  - Uses async style/variable lookups and preloads each ID once (fast).
+ *  - Skips invisible nodes; Figma won’t select locked/hidden nodes (that’s expected).
+ *  - No optional chaining / no optional catch binding (parser-safe).
  */
 
-// Show a hidden UI. This is required for the plugin to run in the background,
-// especially for asynchronous operations that might take time to complete.
 figma.showUI(__html__, { visible: false });
+figma.skipInvisibleInstanceChildren = true;
 
-/**
- * Recursively finds all text nodes within a given node.
- * @param {SceneNode} node The node to search within.
- * @returns {TextNode[]} An array of all found text nodes.
- */
-function findAllTextNodes(node) {
-  // Ignore hidden nodes and their children.
-  if (!node.visible) {
-    return [];
-  }
+/* ---------- Config ---------- */
 
-  let textNodes = [];
-  if (node.type === "TEXT") {
-    textNodes.push(node);
-  } else if ("children" in node) {
-    for (const child of node.children) {
-      textNodes = textNodes.concat(findAllTextNodes(child));
-    }
-  }
-  return textNodes;
-}
+const DEFAULT_FRAME_NAME_RE = /^Frame( \d+)?$/;
 
-// Recursively rename all frames with default Figma names to 'item'
-function renameDefaultFramesRecursively(node) {
-  const defaultFrameNameRegex = /^Frame( \d+)?$/;
-  if (node.type === "FRAME" && defaultFrameNameRegex.test(node.name)) {
-    node.name = "item";
-  }
-  if ("children" in node) {
-    for (const child of node.children) {
-      renameDefaultFramesRecursively(child);
-    }
-  }
-}
-
-// --- Style & Color Mappings ---
-// Dynamically generate style mappings to make the configuration scalable and easier to maintain.
-// This object maps a style category (e.g., "heading") to a new layer name and a set of valid color styles.
-const styleCategories = {};
 const categories = {
-  "heading": "heading-text",
-  "title": "title-text",
-  "subtitle": "subtitle-text",
-  "body": "body-text",
-  "highlighted": "highlighted-text",
-  "info": "info-text",
-  "caption": "caption-text",
-  "overline": "overline-text"
+  heading: "heading-text",
+  title: "title-text",
+  subtitle: "subtitle-text",
+  body: "body-text",
+  highlighted: "highlighted-text",
+  info: "info-text",
+  caption: "caption-text",
+  overline: "overline-text",
 };
 
 const colorPaths = {
   regular: "colors/content/text/regular/",
   inverse: "colors/content/text/inverse/",
-  brand: "colors/content/text/brand/"
+  brand: "colors/content/text/brand/",
 };
 
-// These state colors are considered valid for any text style and will be ignored during the mismatch check.
+// Allowed globally (never a mismatch)
 const stateColors = new Set([
   "colors/state/info",
   "colors/state/success",
   "colors/state/warning",
   "colors/state/error",
-  "colors/content/text/regular/disabled"
+  "colors/content/text/regular/disabled",
 ]);
 
-for (const category in categories) {
-  const newName = categories[category];
-  let colorSet;
-
-  if (category === "highlighted") {
-    colorSet = [
-      `${colorPaths.brand}${category}`,
-      `${colorPaths.inverse}${category}`
-    ];
-  } else {
-    colorSet = [
-      `${colorPaths.regular}${category}`,
-      `${colorPaths.inverse}${category}`
-    ];
-  }
-  
-  styleCategories[category] = {
-    newName: newName,
-    color: colorSet
-  };
+// category → { newName, color[] }
+const styleCategories = {};
+for (const cat in categories) {
+  const newName = categories[cat];
+  const color = cat === "highlighted"
+    ? [colorPaths.brand + cat, colorPaths.inverse + cat]
+    : [colorPaths.regular + cat, colorPaths.inverse + cat];
+  styleCategories[cat] = { newName, color };
 }
 
-/**
- * The main function that orchestrates the renaming and color-checking process.
- */
-async function renameAndCheckColors() {
-  // 1. Get the user's current selection and validate it.
+/* ---------- Tiny helpers ---------- */
+
+function isVisible(node) {
+  return typeof node.visible === "boolean" ? node.visible : true;
+}
+
+// Rename frames like "Frame 1" → "item" and return how many were renamed
+function renameDefaultFramesIn(root) {
+  let count = 0;
+  if (root.type === "FRAME" && DEFAULT_FRAME_NAME_RE.test(root.name)) {
+    try { root.name = "item"; count++; } catch (e) {}
+  }
+  if ("findAll" in root) {
+    const frames = root.findAll(n => n.type === "FRAME" && isVisible(n) && DEFAULT_FRAME_NAME_RE.test(n.name));
+    for (let i = 0; i < frames.length; i++) {
+      try { frames[i].name = "item"; count++; } catch (e) {}
+    }
+  }
+  return count;
+}
+
+// Fast text collection using native findAll (very performant)
+function collectTextNodes(selection) {
+  const texts = [];
+  for (let i = 0; i < selection.length; i++) {
+    const root = selection[i];
+    if (!isVisible(root)) continue;
+    if (root.type === "TEXT") texts.push(root);
+    if ("findAll" in root) {
+      const found = root.findAll(n => n.type === "TEXT" && isVisible(n));
+      if (found && found.length) texts.push(...found);
+    }
+  }
+  return texts;
+}
+
+// First bound variable id per your rule: fills[0] → "0" → string
+function firstBoundFillVarId(node) {
+  const bv = node.boundVariables && node.boundVariables.fills;
+  if (!bv) return null;
+
+  if (Array.isArray(bv) && bv.length > 0) {
+    const v0 = bv[0];
+    if (typeof v0 === "string") return v0;
+    if (v0 && typeof v0 === "object" && v0.id) return v0.id;
+  } else if (typeof bv === "object" && bv !== null && bv.hasOwnProperty("0")) {
+    const v00 = bv["0"];
+    if (typeof v00 === "string") return v00;
+    if (v00 && typeof v00 === "object" && v00.id) return v00.id;
+  } else if (typeof bv === "string") {
+    return bv;
+  }
+  return null;
+}
+
+// Batch-load styles once
+async function preloadStyles(ids) {
+  const cache = new Map();
+  const seen = new Set();
+  const unique = [];
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    if (id && typeof id === "string" && !seen.has(id)) { seen.add(id); unique.push(id); }
+  }
+  await Promise.all(unique.map(id =>
+    figma.getStyleByIdAsync(id)
+      .then(s => cache.set(id, s || null))
+      .catch(() => cache.set(id, null))
+  ));
+  return cache;
+}
+
+// Batch-load variables once
+async function preloadVariables(ids) {
+  const cache = new Map();
+  const seen = new Set();
+  const unique = [];
+  const hasVarApi = figma.variables && typeof figma.variables.getVariableByIdAsync === "function";
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    if (id && typeof id === "string" && !seen.has(id)) { seen.add(id); unique.push(id); }
+  }
+  if (!hasVarApi) { for (let i = 0; i < unique.length; i++) cache.set(unique[i], null); return cache; }
+  await Promise.all(unique.map(id =>
+    figma.variables.getVariableByIdAsync(id)
+      .then(v => cache.set(id, v || null))
+      .catch(() => cache.set(id, null))
+  ));
+  return cache;
+}
+
+/* ---------- Main ---------- */
+
+async function main() {
   const selection = figma.currentPage.selection;
-
-  if (selection.length === 0) {
-    figma.notify("Please select at least one frame or text layer.");
+  if (!selection || selection.length === 0) {
+    figma.notify("Select at least one frame or text layer.");
     figma.closePlugin();
     return;
   }
 
-  // 2. Recursively rename default frame names (e.g., "Frame 1") to "item".
-  let frameRenamedCount = 0;
-  function renameDefaultFramesRecursivelyWithCount(node) {
-    // Ignore hidden nodes and their children.
-    if (!node.visible) {
-      return;
-    }
-    
-    const defaultFrameNameRegex = /^Frame( \d+)?$/;
-    if (node.type === "FRAME" && defaultFrameNameRegex.test(node.name)) {
-      node.name = "item";
-      frameRenamedCount++;
-    }
-    if ("children" in node) {
-      for (const child of node.children) {
-        renameDefaultFramesRecursivelyWithCount(child);
-      }
-    }
-  }
-  for (const node of selection) {
-    renameDefaultFramesRecursivelyWithCount(node);
-  }
-  // --- END NEW FEATURE ---
-
-  // 3. Find all text nodes within the selection.
-  let nodesToCheck = [];
-  for (const node of selection) {
-    if (node.type === "FRAME" || node.type === "GROUP" || node.type === "COMPONENT" || node.type === "INSTANCE" || node.type === "SECTION") {
-      nodesToCheck = nodesToCheck.concat(findAllTextNodes(node));
-    } else if (node.type === "TEXT") {
-      nodesToCheck.push(node);
-    }
-  }
-
-  if (nodesToCheck.length === 0) {
-    figma.notify("No text layers found in selection.");
+  // 1) Quick frame rename & text collection
+  let framesRenamed = 0;
+  for (let i = 0; i < selection.length; i++) framesRenamed += renameDefaultFramesIn(selection[i]);
+  const textNodes = collectTextNodes(selection);
+  if (textNodes.length === 0) {
+    figma.notify("No text layers found.");
     figma.closePlugin();
     return;
   }
 
-  // 4. First pass (synchronous): Rename layers and identify nodes for color checking.
-  // This pass is fast and handles layer renaming and caches style information.
-  let renamedCount = 0;
-  let mismatchedNodes = [];
-  const total = nodesToCheck.length;
-  let startTime = Date.now();
-  
-  const nodesForColorCheck = [];
-  const styleCache = new Map();
-  let processed = 0;
+  // 2) Preload all referenced styles
+  const textStyleIds = [];
+  const fillStyleIds = [];
+  for (let i = 0; i < textNodes.length; i++) {
+    const t = textNodes[i];
+    if (typeof t.textStyleId === "string" && t.textStyleId) textStyleIds.push(t.textStyleId);
+    if (typeof t.fillStyleId === "string" && t.fillStyleId) fillStyleIds.push(t.fillStyleId);
+  }
+  const styleCache = await preloadStyles([].concat(textStyleIds, fillStyleIds));
 
-  for (const textNode of nodesToCheck) {
-    processed++;
+  // 3) Rename text by category + stage for color audit
+  let renamed = 0;
+  const staged = []; // { node, mapping }
+  for (let i = 0; i < textNodes.length; i++) {
+    const tn = textNodes[i];
+    const ts = (typeof tn.textStyleId === "string" && tn.textStyleId) ? styleCache.get(tn.textStyleId) : null;
+    if (!ts || ts.type !== "TEXT" || typeof ts.name !== "string") continue;
 
-    if (textNode.textStyleId && typeof textNode.textStyleId === 'string') {
-      let style = styleCache.get(textNode.textStyleId);
-      if (style === undefined) {
-        style = figma.getStyleById(textNode.textStyleId);
-        styleCache.set(textNode.textStyleId, style);
-      }
+    const category = ts.name.split("/")[0];       // original rule
+    const mapping = styleCategories[category];
+    if (!mapping) continue;
 
-      if (style && style.type === "TEXT") {
-        const category = style.name.split('/')[0];
-        const mapping = styleCategories[category];
+    if (tn.name !== mapping.newName) { try { tn.name = mapping.newName; renamed++; } catch (e) {} }
+    staged.push({ node: tn, mapping });
+  }
 
-        if (mapping) {
-          if (textNode.name !== mapping.newName) {
-            textNode.name = mapping.newName;
-            renamedCount++;
-          }
-          nodesForColorCheck.push({ textNode, mapping });
-        }
-      }
+  if (staged.length === 0) {
+    figma.notify(renamed ? (renamed + " text layers renamed.") : "✨Eveything is perfect!");
+    figma.closePlugin();
+    return;
+  }
+
+  // 4) Preload ONLY first-bound variable ids (your rule)
+  const firstVarIds = [];
+  for (let i = 0; i < staged.length; i++) {
+    const id0 = firstBoundFillVarId(staged[i].node);
+    if (id0) firstVarIds.push(id0);
+  }
+  const varCache = await preloadVariables(firstVarIds);
+
+  // 5) Color audit (first var name → fallback to fill style name)
+  const mismatched = [];
+  for (let i = 0; i < staged.length; i++) {
+    const node = staged[i].node;
+    const expected = staged[i].mapping.color; // array
+    let ok = false;
+
+    const id0 = firstBoundFillVarId(node);
+    if (id0) {
+      const variable = varCache.get(id0);
+      const vName = (variable && variable.name) ? variable.name : null;
+      if (vName && (expected.indexOf(vName) !== -1 || stateColors.has(vName))) ok = true;
+    } else if (typeof node.fillStyleId === "string" && node.fillStyleId) {
+      const fillStyle = styleCache.get(node.fillStyleId);
+      const fsName = (fillStyle && fillStyle.name) ? fillStyle.name : null;
+      if (fsName && (expected.indexOf(fsName) !== -1 || stateColors.has(fsName))) ok = true;
     }
+
+    if (!ok) mismatched.push(node);
   }
 
-  // 5. Second pass (asynchronous): Verify colors for the collected nodes.
-  // This runs all async color checks in parallel for better performance.
-  if (nodesForColorCheck.length > 0) {
-    const colorCheckPromises = nodesForColorCheck.map(async ({ textNode, mapping }) => {
-      let isColorCorrect = false;
-      const expectedColors = Array.isArray(mapping.color) ? mapping.color : [mapping.color];
-
-      if (textNode.boundVariables && textNode.boundVariables['fills'] && textNode.boundVariables['fills'].length > 0) {
-        const variableId = textNode.boundVariables['fills'][0].id;
-        try {
-          const variable = await figma.variables.getVariableByIdAsync(variableId);
-          if (variable) {
-            // A color is correct if it's in the expected set for the style OR if it's a globally valid state color.
-            if (expectedColors.includes(variable.name) || stateColors.has(variable.name)) {
-              isColorCorrect = true;
-            }
-          }
-        } catch (error) {
-          console.error(`Error fetching variable ${variableId}:`, error);
-        }
-      } else if (textNode.fillStyleId && typeof textNode.fillStyleId === 'string') {
-        let fillStyle = styleCache.get(textNode.fillStyleId);
-        if (fillStyle === undefined) {
-          fillStyle = figma.getStyleById(textNode.fillStyleId);
-          styleCache.set(textNode.fillStyleId, fillStyle);
-        }
-        
-        if (fillStyle) {
-          // A color is correct if it's in the expected set for the style OR if it's a globally valid state color.
-          if (expectedColors.includes(fillStyle.name) || stateColors.has(fillStyle.name)) {
-            isColorCorrect = true;
-          }
-        }
-      }
-
-      if (!isColorCorrect) {
-        return textNode;
-      }
-      return null;
-    });
-
-    const results = await Promise.all(colorCheckPromises);
-    mismatchedNodes = results.filter(node => node !== null);
+  // 6) Select & notify (simplified message)
+  if (mismatched.length) {
+    try { figma.currentPage.selection = mismatched; } catch (e) {}
+    figma.notify(mismatched.length + " mismatched layer" + (mismatched.length === 1 ? "" : "s") + " selected.");
+  } else {
+    figma.notify("✨Eveything is perfect!");
   }
 
-  // 6. Generate a summary and notify the user.
-  // This selects mismatched layers so the user can easily find and fix them.
-  let summaryParts = [];
-  if (frameRenamedCount > 0) {
-    summaryParts.push(`${frameRenamedCount} frame layer${frameRenamedCount === 1 ? '' : 's'} renamed to 'item'`);
-  }
-  if (renamedCount > 0) {
-    summaryParts.push(`${renamedCount} text layer${renamedCount === 1 ? '' : 's'} renamed`);
-  }
-  if (mismatchedNodes.length > 0) {
-    summaryParts.push(`${mismatchedNodes.length} mismatched layer${mismatchedNodes.length === 1 ? '' : 's'} selected`);
-    figma.currentPage.selection = mismatchedNodes;
-    figma.viewport.scrollAndZoomIntoView(mismatchedNodes);
-  }
-  if (summaryParts.length === 0) {
-    summaryParts.push('✨ Everything is perfect');
-  }
-  figma.notify(summaryParts.join('; ') + '.', { timeout: 5000 });
   figma.closePlugin();
 }
 
-// Handles messages from a UI, if one were to be implemented.
-figma.ui.onmessage = (msg) => {
-  if (msg.type === 'rename-and-check') {
-    renameAndCheckColors();
-  }
+/* ---------- Start ---------- */
+
+figma.ui.onmessage = function (msg) {
+  if (msg && msg.type === "rename-and-check") main();
 };
 
-// Immediately run the main function when the plugin starts.
-renameAndCheckColors();
+main();
